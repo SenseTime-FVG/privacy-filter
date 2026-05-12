@@ -36,7 +36,9 @@ By default, `opf` looks for a model at the directory pointed to by the `OPF_CHEC
 opf "Alice was born on 1990-01-02."
 ```
 
-The code supports running both on GPU (by default) and CPU. To run on CPU, use `--device cpu` flag:
+The code supports running both on GPU (by default) and CPU. The `--device`
+flag uses PyTorch device names such as `cpu`, `cuda`, and `cuda:0`; `gpu`
+is also accepted as an alias for `cuda`. To run on CPU, use `--device cpu`:
 
 ```bash
 opf --device cpu "Alice was born on 1990-01-02."
@@ -89,6 +91,12 @@ Consult `opf eval --help` for more flags and information about the evaluation mo
 
 ```bash
 opf serve --device cpu --host 0.0.0.0 --port 8000 --max-batch-size 32 --batch-timeout-ms 10
+```
+
+To bind the service on GPU, use `--device cuda` (or `--device gpu`):
+
+```bash
+opf serve --device cuda --host 0.0.0.0 --port 8000
 ```
 
 This service keeps a single shared model instance in memory, queues incoming

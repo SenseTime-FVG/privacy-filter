@@ -327,7 +327,12 @@ def load_inference_runtime(
     if output_mode not in OUTPUT_MODES:
         raise ValueError(f"Unsupported output_mode: {output_mode!r}")
     _validate_checkpoint_dir(checkpoint)
-    device = torch.device(device_name)
+    normalized_device_name = device_name.strip().lower()
+    if normalized_device_name == "gpu":
+        normalized_device_name = "cuda"
+    elif normalized_device_name.startswith("gpu:"):
+        normalized_device_name = f"cuda:{normalized_device_name.split(':', 1)[1]}"
+    device = torch.device(normalized_device_name)
     checkpoint_config = _load_checkpoint_config(checkpoint)
     n_ctx = _resolve_n_ctx(checkpoint_config, n_ctx_override, device)
     encoding_name = checkpoint_config.get("encoding")

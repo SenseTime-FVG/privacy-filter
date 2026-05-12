@@ -56,7 +56,7 @@ def add_device_arg(parser: object) -> None:
         "--device",
         type=str,
         default="cuda",
-        help="Device to run on",
+        help="Device to run on (for example: cpu, cuda, cuda:0, or gpu as an alias for cuda).",
     )
 
 
