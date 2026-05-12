@@ -1,6 +1,13 @@
 """Public OPF package."""
 
-__all__ = ["DecodeOptions", "INHERIT", "OPF", "RedactionResult", "redact"]
+__all__ = [
+    "DecodeOptions",
+    "INHERIT",
+    "OPF",
+    "RedactionResult",
+    "redact",
+    "redact_many",
+]
 
 
 def redact(text: str) -> str:
@@ -19,6 +26,17 @@ def redact(text: str) -> str:
     from ._api import redact as redact_impl
 
     return redact_impl(text)
+
+
+def redact_many(
+    texts: list[str] | tuple[str, ...],
+    *,
+    window_batch_size: int | None = None,
+) -> tuple[str, ...]:
+    """Redact multiple text strings with the default local OPF model."""
+    from ._api import redact_many as redact_many_impl
+
+    return redact_many_impl(texts, window_batch_size=window_batch_size)
 
 
 def __getattr__(name: str):

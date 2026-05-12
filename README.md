@@ -26,7 +26,7 @@ Repository resources: [License](LICENSE) and [Security Policy](SECURITY.md).
 pip install -e .
 ```
 
-After this, you will have a python script `opf` that can be run directly or via `python -m opf`. The script can be used in 3 separate ways, as described below.
+After this, you will have a python script `opf` that can be run directly or via `python -m opf`. The script can be used in 4 separate ways, as described below.
 
 2. Run one-shot redaction:
 
@@ -60,6 +60,17 @@ The redaction can also be performed via pipes, to support complex one-liners:
 cat /path/to/file | grep -e 'some_pattern' | opf
 ```
 
+For higher-throughput non-interactive runs with many short inputs, the CLI now
+accumulates inputs and runs batched inference automatically. You can control the
+maximum number of queued inputs with `--input-batch-size`:
+
+```bash
+cat /path/to/lines.txt | opf --input-batch-size 64
+```
+
+The Python API also exposes `OPF.redact_many(...)` and `opf.redact_many(...)`
+for batched local inference.
+
 If no input is provided, `opf` will start in interactive mode. In this mode, for each input example, the CLI prints structured JSON output, using ANSI color-coded previews if the terminal supports them. These options can be controlled by flags.
 
 Consult `opf redact --help` for more flags and information about the redaction mode.
@@ -74,7 +85,54 @@ The sample eval fixtures under `examples/data/sample_eval_five_examples*.jsonl` 
 
 Consult `opf eval --help` for more flags and information about the evaluation mode.
 
-4. Finetune on your own labeled dataset:
+4. Run an HTTP service for concurrent clients:
+
+```bash
+opf serve --device cpu --host 0.0.0.0 --port 8000 --max-batch-size 32 --batch-timeout-ms 10
+```
+
+This service keeps a single shared model instance in memory, queues incoming
+requests, and combines nearby requests into one batched inference call. That is
+the recommended way to handle bursts such as 100 concurrent client requests.
+
+Useful endpoints:
+
+- `GET /healthz`
+- `POST /redact` with body `{"text": "Alice was born on 1990-01-02."}`
+- `POST /redact/batch` with body `{"texts": ["...", "..."]}`
+
+FastAPI also exposes interactive docs at `/docs`.
+
+Quick `curl` smoke tests:
+
+```bash
+curl -s http://127.0.0.1:8000/healthz
+```
+
+```bash
+curl -s http://127.0.0.1:8000/redact \
+	-H 'Content-Type: application/json' \
+	-d '{"text":"Alice was born on 1990-01-02 and lives at 1 Main St."}'
+```
+
+```bash
+curl -s http://127.0.0.1:8000/redact/batch \
+	-H 'Content-Type: application/json' \
+	-d '{"texts":["Alice was born on 1990-01-02.","Email me at alice@example.com.","My phone is 555-123-4567."]}'
+```
+
+If you want to simulate a burst of concurrent client calls, this shell one-liner
+fires 100 parallel `POST /redact` requests:
+
+```bash
+seq 100 | xargs -I{} -P 100 curl -s http://127.0.0.1:8000/redact \
+	-H 'Content-Type: application/json' \
+	-d '{"text":"Request {}: Alice was born on 1990-01-02."}' >/dev/null
+```
+
+Consult `opf serve --help` for queueing and batching flags.
+
+5. Finetune on your own labeled dataset:
 
 ```bash
 opf train /path/to/train.jsonl --output-dir /path/to/finetuned_checkpoint
@@ -84,11 +142,12 @@ Consult `opf train --help` for more flags and information about the finetuning m
 
 ### Structure
 
-- `opf/__main__.py`: unified CLI entrypoint for redact, eval, and train modes.
+- `opf/__main__.py`: unified CLI entrypoint for redact, eval, train, and serve modes.
 - `opf/_api.py`: Python-facing API over the runtime and decoding stack.
 - `opf/_cli/`: command-line argument parsing and terminal rendering helpers.
 - `opf/_core/`: runtime loading, span conversion, and shared decoding logic.
 - `opf/_eval/`: dataset loading, preprocessing, metrics, and evaluation runners.
+- `opf/_serve/`: FastAPI-based HTTP service and micro-batching queue.
 - `opf/_train/`: local finetuning argument parsing and training runners.
 - `opf/_model/`: transformer implementation, checkpoint config, and weight loading.
 - `examples/data/`: sample eval files plus reproducible finetuning demo datasets.

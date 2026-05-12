@@ -55,6 +55,15 @@ def add_common_redaction_args(
     )
     add_device_arg(runtime_group)
     add_n_ctx_arg(runtime_group)
+    runtime_group.add_argument(
+        "--input-batch-size",
+        type=int,
+        default=32,
+        help=(
+            "Maximum number of input texts to accumulate per non-interactive "
+            "batch before calling batched inference."
+        ),
+    )
     add_decode_mode_arg(decode_group)
     add_discard_overlapping_predicted_spans_arg(decode_group)
     add_trim_whitespace_args(parser, decode_group)

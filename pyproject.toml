@@ -9,12 +9,14 @@ description = "Standalone local-only OPF PyTorch model and eval tools."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "fastapi",
   "huggingface_hub",
   "numpy",
   "packaging",
   "torch",
   "safetensors",
   "tiktoken",
+  "uvicorn",
 ]
 
 [project.scripts]

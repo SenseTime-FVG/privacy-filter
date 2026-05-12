@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from dataclasses import dataclass
+import threading
 from typing import Mapping, Sequence
 
 import torch
@@ -152,6 +153,7 @@ class ViterbiCRFDecoder:
             tuple[str, int, torch.dtype],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        self._score_cache_lock = threading.Lock()
 
         background_token_idx = self.label_info.background_token_label
         background_span_idx = self.label_info.background_span_label
@@ -285,14 +287,15 @@ class ViterbiCRFDecoder:
         else:
             device_index = device.index if device.index is not None else -1
             cache_key = (device.type, device_index, dtype)
-            cached_scores = self._score_cache.get(cache_key)
-            if cached_scores is None:
-                cached_scores = (
-                    self._start_scores.to(device=device, dtype=dtype),
-                    self._end_scores.to(device=device, dtype=dtype),
-                    self._transition_scores.to(device=device, dtype=dtype),
-                )
-                self._score_cache[cache_key] = cached_scores
+            with self._score_cache_lock:
+                cached_scores = self._score_cache.get(cache_key)
+                if cached_scores is None:
+                    cached_scores = (
+                        self._start_scores.to(device=device, dtype=dtype),
+                        self._end_scores.to(device=device, dtype=dtype),
+                        self._transition_scores.to(device=device, dtype=dtype),
+                    )
+                    self._score_cache[cache_key] = cached_scores
             start_scores, end_scores, transition_scores = cached_scores
 
         scores = token_logprobs[0] + start_scores
@@ -398,14 +401,15 @@ class ViterbiCRFDecoder:
         lengths_t = torch.tensor(lengths, device=device, dtype=torch.long)
         device_index = device.index if device.index is not None else -1
         cache_key = (device.type, device_index, dtype)
-        cached_scores = self._score_cache.get(cache_key)
-        if cached_scores is None:
-            cached_scores = (
-                self._start_scores.to(device=device, dtype=dtype),
-                self._end_scores.to(device=device, dtype=dtype),
-                self._transition_scores.to(device=device, dtype=dtype),
-            )
-            self._score_cache[cache_key] = cached_scores
+        with self._score_cache_lock:
+            cached_scores = self._score_cache.get(cache_key)
+            if cached_scores is None:
+                cached_scores = (
+                    self._start_scores.to(device=device, dtype=dtype),
+                    self._end_scores.to(device=device, dtype=dtype),
+                    self._transition_scores.to(device=device, dtype=dtype),
+                )
+                self._score_cache[cache_key] = cached_scores
         start_scores, end_scores, transition_scores = cached_scores
 
         scores = emissions[:, 0, :] + start_scores[None, :]

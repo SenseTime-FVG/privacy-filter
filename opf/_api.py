@@ -5,7 +5,8 @@ import functools
 import json
 import os
 from pathlib import Path
-from typing import Literal, TypeVar
+import threading
+from typing import Literal, Sequence, TypeVar
 
 from ._common.checkpoint_download import ensure_default_checkpoint
 from ._core.decoding import ViterbiCRFDecoder, build_sequence_decoder
@@ -16,6 +17,7 @@ from ._core.runtime import (
     build_detection_summary,
     load_inference_runtime,
     predict_text,
+    predict_texts,
 )
 
 
@@ -232,6 +234,32 @@ class OPF:
         self._decoder_config = _DecoderConfig(decode_mode=str(decode_mode))
         self._runtime = None
         self._decoders: dict[_DecoderConfig, ViterbiCRFDecoder | None] = {}
+        self._runtime_lock = threading.RLock()
+        self._decoder_lock = threading.RLock()
+
+    def _build_redaction_output(
+        self,
+        *,
+        runtime,
+        prediction: PredictionResult,
+    ) -> str | RedactionResult:
+        """Build one API return object from a raw prediction result."""
+        redacted_text = _redact_text(prediction.text, prediction.spans)
+        if self._output_text_only:
+            return redacted_text
+        summary = build_detection_summary(
+            output_mode=runtime.output_mode,
+            labels=[span.label for span in prediction.spans],
+            decoded_mismatch=prediction.decoded_mismatch,
+        )
+        return RedactionResult(
+            schema_version=SCHEMA_VERSION,
+            summary=summary,
+            text=prediction.text,
+            detected_spans=tuple(prediction.spans),
+            redacted_text=redacted_text,
+            warning=_warning_for_prediction(prediction),
+        )
 
     def redact(
         self,
@@ -256,21 +284,36 @@ class OPF:
         """
         runtime, decoder = self.get_prediction_components(decode=decode)
         prediction = predict_text(runtime, text, decoder=decoder)
-        redacted_text = _redact_text(prediction.text, prediction.spans)
-        if self._output_text_only:
-            return redacted_text
-        summary = build_detection_summary(
-            output_mode=runtime.output_mode,
-            labels=[span.label for span in prediction.spans],
-            decoded_mismatch=prediction.decoded_mismatch,
+        return self._build_redaction_output(runtime=runtime, prediction=prediction)
+
+    def redact_many(
+        self,
+        texts: Sequence[str],
+        *,
+        decode: DecodeOptions | None = None,
+        window_batch_size: int | None = None,
+    ) -> tuple[str | RedactionResult, ...]:
+        """Run redaction over multiple inputs with batched model forwards.
+
+        Args:
+            texts: Input texts to redact.
+            decode: Optional per-call decode overrides.
+            window_batch_size: Optional maximum number of runtime windows to
+                batch together in a single forward pass.
+
+        Returns:
+            A tuple containing one result per input text, in order.
+        """
+        runtime, decoder = self.get_prediction_components(decode=decode)
+        predictions = predict_texts(
+            runtime,
+            list(texts),
+            decoder=decoder,
+            window_batch_size=window_batch_size,
         )
-        return RedactionResult(
-            schema_version=SCHEMA_VERSION,
-            summary=summary,
-            text=prediction.text,
-            detected_spans=tuple(prediction.spans),
-            redacted_text=redacted_text,
-            warning=_warning_for_prediction(prediction),
+        return tuple(
+            self._build_redaction_output(runtime=runtime, prediction=prediction)
+            for prediction in predictions
         )
 
     def set_model_path(self, model_path: str | os.PathLike[str]) -> OPF:
@@ -401,15 +444,18 @@ class OPF:
             ValueError: If runtime configuration is invalid.
             RuntimeError: If the checkpoint cannot be loaded.
         """
-        if self._runtime is None:
-            self._runtime = load_inference_runtime(
-                checkpoint=self._checkpoint,
-                device_name=self._device,
-                n_ctx_override=self._context_window_length,
-                trim_span_whitespace=self._trim_whitespace,
-                discard_overlapping_predicted_spans=self._discard_overlapping_predicted_spans,
-                output_mode=self._output_mode,
-            )
+        if self._runtime is not None:
+            return self._runtime
+        with self._runtime_lock:
+            if self._runtime is None:
+                self._runtime = load_inference_runtime(
+                    checkpoint=self._checkpoint,
+                    device_name=self._device,
+                    n_ctx_override=self._context_window_length,
+                    trim_span_whitespace=self._trim_whitespace,
+                    discard_overlapping_predicted_spans=self._discard_overlapping_predicted_spans,
+                    output_mode=self._output_mode,
+                )
         return self._runtime
 
     def _resolve_effective_decoder_config(
@@ -455,14 +501,17 @@ class OPF:
 
     def _get_decoder(self, runtime, decoder_config: _DecoderConfig):
         """Build or reuse the cached decoder for one effective configuration."""
-        if decoder_config not in self._decoders:
-            decoder, _ = build_sequence_decoder(
-                decode_mode=decoder_config.decode_mode,
-                label_info=runtime.label_info,
-                viterbi_calibration_path=decoder_config.viterbi_calibration_path,
-                checkpoint_dir=runtime.checkpoint,
-            )
-            self._decoders[decoder_config] = decoder
+        if decoder_config in self._decoders:
+            return self._decoders[decoder_config]
+        with self._decoder_lock:
+            if decoder_config not in self._decoders:
+                decoder, _ = build_sequence_decoder(
+                    decode_mode=decoder_config.decode_mode,
+                    label_info=runtime.label_info,
+                    viterbi_calibration_path=decoder_config.viterbi_calibration_path,
+                    checkpoint_dir=runtime.checkpoint,
+                )
+                self._decoders[decoder_config] = decoder
         return self._decoders[decoder_config]
 
 
@@ -486,3 +535,16 @@ def redact(text: str) -> str:
         RuntimeError: If the local checkpoint cannot be loaded.
     """
     return str(_default_redactor().redact(text))
+
+
+def redact_many(
+    texts: Sequence[str],
+    *,
+    window_batch_size: int | None = None,
+) -> tuple[str, ...]:
+    """Redact multiple texts with the cached default text-only OPF redactor."""
+    results = _default_redactor().redact_many(
+        texts,
+        window_batch_size=window_batch_size,
+    )
+    return tuple(str(item) for item in results)

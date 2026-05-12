@@ -202,6 +202,118 @@ def _select_non_overlapping_spans(spans: Sequence[DetectedSpan]) -> list[Detecte
     return kept
 
 
+def _resolve_window_batch_size(
+    *,
+    device: torch.device,
+    requested: int | None,
+) -> int:
+    """Resolve the inference window batch size from args/env/defaults."""
+    if requested is not None:
+        if requested <= 0:
+            raise ValueError("window_batch_size must be positive")
+        return requested
+    raw = os.environ.get("OPF_WINDOW_BATCH_SIZE")
+    if raw is not None and raw.strip():
+        try:
+            value = int(raw.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"OPF_WINDOW_BATCH_SIZE must be an integer (got {raw!r})"
+            ) from exc
+        if value <= 0:
+            raise ValueError("OPF_WINDOW_BATCH_SIZE must be positive")
+        return value
+    return 8 if device.type == "cuda" else 1
+
+
+def _resolve_viterbi_cuda_batch_size() -> int:
+    """Read and validate the CUDA Viterbi batch size from the environment."""
+    raw = os.environ.get("OPF_VITERBI_CUDA_BATCH_SIZE", "512").strip()
+    try:
+        batch_size = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"OPF_VITERBI_CUDA_BATCH_SIZE must be an integer (got {raw!r})"
+        ) from exc
+    if batch_size <= 0:
+        raise ValueError("OPF_VITERBI_CUDA_BATCH_SIZE must be positive")
+    return batch_size
+
+
+def _resolve_decoder_device(
+    runtime: InferenceRuntime,
+    decoder: ViterbiCRFDecoder | None,
+) -> torch.device | None:
+    """Return the optional CUDA device used for batched Viterbi decoding."""
+    if decoder is None:
+        return None
+    if runtime.device.type != "cuda":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if not get_env_bool("OPF_VITERBI_ON_CUDA", default=True):
+        return None
+    return runtime.device
+
+
+def _build_prediction_result(
+    runtime: InferenceRuntime,
+    *,
+    text: str,
+    token_ids: Sequence[int],
+    predicted_labels_by_index: dict[int, int],
+) -> PredictionResult:
+    """Build one structured prediction result from decoded token labels."""
+    predicted_token_spans = labels_to_spans(
+        predicted_labels_by_index, runtime.label_info
+    )
+
+    decoded_text, char_starts, char_ends = decode_text_with_offsets(
+        token_ids, runtime.encoding
+    )
+    decoded_mismatch = decoded_text != text
+    source_text = decoded_text if decoded_mismatch else text
+
+    predicted_char_spans = token_spans_to_char_spans(
+        predicted_token_spans, char_starts, char_ends
+    )
+    if runtime.trim_span_whitespace:
+        predicted_char_spans = trim_char_spans_whitespace(
+            predicted_char_spans, source_text
+        )
+    if runtime.discard_overlapping_predicted_spans:
+        predicted_char_spans = discard_overlapping_spans_by_label(predicted_char_spans)
+
+    detected: list[DetectedSpan] = []
+    for label_idx, start, end in predicted_char_spans:
+        if not (0 <= start < end <= len(source_text)):
+            continue
+        label = (
+            str(runtime.label_info.span_class_names[label_idx])
+            if 0 <= int(label_idx) < len(runtime.label_info.span_class_names)
+            else f"label_{label_idx}"
+        )
+        detected.append(
+            DetectedSpan(
+                label=label,
+                start=int(start),
+                end=int(end),
+                text=source_text[start:end],
+                placeholder=_label_placeholder(label),
+            )
+        )
+
+    display_spans = _apply_output_mode_to_detected_spans(
+        _select_non_overlapping_spans(detected),
+        output_mode=runtime.output_mode,
+    )
+    return PredictionResult(
+        text=source_text,
+        spans=tuple(display_spans),
+        decoded_mismatch=decoded_mismatch,
+    )
+
+
 def load_inference_runtime(
     *,
     checkpoint: str,
@@ -262,134 +374,191 @@ def predict_text(
     decoder: ViterbiCRFDecoder | None,
 ) -> PredictionResult:
     """Run one text through the model and return decoded detected spans."""
-    token_ids = tuple(
-        int(tok) for tok in runtime.encoding.encode(text, allowed_special="all")
-    )
-    if not token_ids:
-        return PredictionResult(text=text, spans=(), decoded_mismatch=False)
+    return predict_texts(runtime, [text], decoder=decoder, window_batch_size=1)[0]
 
-    example_id = "demo-example"
+
+@torch.inference_mode()
+def predict_texts(
+    runtime: InferenceRuntime,
+    texts: Sequence[str],
+    *,
+    decoder: ViterbiCRFDecoder | None,
+    window_batch_size: int | None = None,
+) -> tuple[PredictionResult, ...]:
+    """Run multiple texts through the model and decode them in batches."""
+    if not texts:
+        return ()
+
+    resolved_window_batch_size = _resolve_window_batch_size(
+        device=runtime.device,
+        requested=window_batch_size,
+    )
     background = int(runtime.label_info.background_token_label)
-    example = TokenizedExample(
-        tokens=token_ids,
-        labels=tuple(background for _ in token_ids),
-        example_id=example_id,
-        text=text,
-    )
-    aggregation = ExampleAggregation(
-        logprob_logsumexp=[], counts=[], labels=[], token_ids=[]
-    )
+    example_order: list[str] = []
+    example_texts: dict[str, str] = {}
+    example_token_ids: dict[str, tuple[int, ...]] = {}
+    aggregated_examples: dict[str, ExampleAggregation] = {}
+    pending_windows: list[object] = []
 
-    for window in example_to_windows(
-        example,
-        runtime.n_ctx,
-    ):
-        if not window.tokens:
-            continue
-        window_tokens = torch.tensor(
-            [list(window.tokens)],
-            device=runtime.device,
-            dtype=torch.int32,
+    def process_window_batch(windows: Sequence[object]) -> None:
+        if not windows:
+            return
+        max_window_len = max(len(window.tokens) for window in windows)
+        if max_window_len <= 0:
+            return
+        token_rows: list[list[int]] = []
+        mask_rows: list[list[bool]] = []
+        for window in windows:
+            window_tokens = list(window.tokens)
+            if not window_tokens:
+                raise ValueError("Window batch contains an empty window")
+            pad_count = max_window_len - len(window_tokens)
+            token_rows.append(window_tokens + ([runtime.pad_token_id] * pad_count))
+            mask_rows.append(([True] * len(window_tokens)) + ([False] * pad_count))
+
+        tokens_t = torch.tensor(token_rows, device=runtime.device, dtype=torch.int32)
+        attention_mask_t = torch.tensor(
+            mask_rows, device=runtime.device, dtype=torch.bool
         )
-        attention_mask = torch.ones_like(window_tokens, dtype=torch.bool)
-        logits = runtime.model(window_tokens, attention_mask=attention_mask)
-        log_probs = F.log_softmax(logits.float(), dim=-1)[0].cpu()
-        if log_probs.shape[0] != len(window.tokens):
-            raise ValueError("Logprob output length does not match window length")
+        logits = runtime.model(tokens_t, attention_mask=attention_mask_t)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
 
-        for token_pos, is_valid in enumerate(window.mask):
-            if not bool(is_valid):
-                continue
-            token_idx = int(window.offsets[token_pos])
-            if token_idx < 0:
-                continue
-            aggregation.ensure_capacity(token_idx)
-            score_vec = log_probs[token_pos]
-            existing = aggregation.logprob_logsumexp[token_idx]
-            if existing is None:
-                aggregation.logprob_logsumexp[token_idx] = score_vec.clone()
-            else:
-                aggregation.logprob_logsumexp[token_idx] = torch.logaddexp(
-                    existing, score_vec
+        if log_probs.dim() != 3 or int(log_probs.shape[0]) != len(windows):
+            raise ValueError(
+                "Batched logprob output shape mismatch: got %s expected (%d,%d,*)"
+                % (tuple(log_probs.shape), len(windows), max_window_len)
+            )
+
+        for batch_idx, window in enumerate(windows):
+            window_log_probs = log_probs[batch_idx].cpu()
+            for token_pos, is_valid in enumerate(window.mask):
+                if not bool(is_valid):
+                    continue
+                token_idx = int(window.offsets[token_pos])
+                if token_idx < 0:
+                    continue
+                example_id = window.token_example_ids[token_pos]
+                if example_id is None:
+                    continue
+                aggregation = aggregated_examples[example_id]
+                aggregation.ensure_capacity(token_idx)
+                score_vec = window_log_probs[token_pos]
+                existing = aggregation.logprob_logsumexp[token_idx]
+                if existing is None:
+                    aggregation.logprob_logsumexp[token_idx] = score_vec.clone()
+                else:
+                    aggregation.logprob_logsumexp[token_idx] = torch.logaddexp(
+                        existing, score_vec
+                    )
+                aggregation.counts[token_idx] += 1
+                aggregation.record_token_id(
+                    token_idx, int(window.tokens[token_pos]), example_id
                 )
-            aggregation.counts[token_idx] += 1
-            aggregation.record_token_id(
-                token_idx, int(window.tokens[token_pos]), example_id
+                aggregation.length = max(aggregation.length, token_idx + 1)
+
+    def enqueue_window(window: object) -> None:
+        if not window.tokens:
+            return
+        pending_windows.append(window)
+        if len(pending_windows) >= resolved_window_batch_size:
+            process_window_batch(tuple(pending_windows))
+            pending_windows.clear()
+
+    for idx, text in enumerate(texts):
+        example_id = f"predict-example-{idx}"
+        token_ids = tuple(
+            int(tok) for tok in runtime.encoding.encode(text, allowed_special="all")
+        )
+        example_order.append(example_id)
+        example_texts[example_id] = text
+        example_token_ids[example_id] = token_ids
+        aggregated_examples[example_id] = ExampleAggregation(
+            logprob_logsumexp=[], counts=[], labels=[], token_ids=[]
+        )
+        if not token_ids:
+            continue
+        example = TokenizedExample(
+            tokens=token_ids,
+            labels=tuple(background for _ in token_ids),
+            example_id=example_id,
+            text=text,
+        )
+        for window in example_to_windows(example, runtime.n_ctx):
+            enqueue_window(window)
+
+    if pending_windows:
+        process_window_batch(tuple(pending_windows))
+
+    states_with_scores: list[str] = []
+    score_tensors: list[torch.Tensor] = []
+    token_positions_by_example: dict[str, list[int]] = {}
+    decoded_labels_by_example: dict[str, list[int]] = {}
+
+    for example_id in example_order:
+        aggregation = aggregated_examples[example_id]
+        token_positions: list[int] = []
+        token_score_vectors: list[torch.Tensor] = []
+        for token_idx in range(aggregation.length):
+            if token_idx >= len(aggregation.logprob_logsumexp):
+                continue
+            score_sum = aggregation.logprob_logsumexp[token_idx]
+            count = aggregation.counts[token_idx]
+            if score_sum is None or count <= 0:
+                continue
+            avg_logprob = score_sum - math.log(float(count))
+            token_positions.append(token_idx)
+            token_score_vectors.append(avg_logprob)
+        token_positions_by_example[example_id] = token_positions
+        if token_score_vectors:
+            states_with_scores.append(example_id)
+            score_tensors.append(torch.stack(token_score_vectors, dim=0))
+
+    if decoder is not None and score_tensors:
+        decode_device = _resolve_decoder_device(runtime, decoder)
+        decoded_many = decoder.decode_many(
+            score_tensors,
+            device=decode_device,
+            max_batch_size=_resolve_viterbi_cuda_batch_size(),
+        )
+        if len(decoded_many) != len(states_with_scores):
+            raise RuntimeError(
+                "Decoder returned unexpected number of decoded sequences: "
+                f"{len(decoded_many)} != {len(states_with_scores)}"
             )
-            aggregation.length = max(aggregation.length, token_idx + 1)
-
-    token_positions: list[int] = []
-    token_score_vectors: list[torch.Tensor] = []
-    for token_idx in range(aggregation.length):
-        if token_idx >= len(aggregation.logprob_logsumexp):
-            continue
-        score_sum = aggregation.logprob_logsumexp[token_idx]
-        count = aggregation.counts[token_idx]
-        if score_sum is None or count <= 0:
-            continue
-        avg_logprob = score_sum - math.log(float(count))
-        token_positions.append(token_idx)
-        token_score_vectors.append(avg_logprob)
-
-    if not token_score_vectors:
-        return PredictionResult(text=text, spans=(), decoded_mismatch=False)
-
-    stacked_scores = torch.stack(token_score_vectors, dim=0)
-    if decoder is not None:
-        decoded_labels = decoder.decode(stacked_scores)
-        if len(decoded_labels) != len(token_positions):
-            decoded_labels = stacked_scores.argmax(dim=1).tolist()
+        for example_id, decoded in zip(states_with_scores, decoded_many):
+            decoded_labels_by_example[example_id] = list(decoded)
     else:
-        decoded_labels = stacked_scores.argmax(dim=1).tolist()
-    predicted_labels_by_index = {
-        token_idx: int(label)
-        for token_idx, label in zip(token_positions, decoded_labels)
-    }
-    predicted_token_spans = labels_to_spans(
-        predicted_labels_by_index, runtime.label_info
-    )
+        for example_id, stacked_scores in zip(states_with_scores, score_tensors):
+            decoded_labels_by_example[example_id] = stacked_scores.argmax(dim=1).tolist()
 
-    decoded_text, char_starts, char_ends = decode_text_with_offsets(
-        token_ids, runtime.encoding
-    )
-    decoded_mismatch = decoded_text != text
-    source_text = decoded_text if decoded_mismatch else text
-
-    predicted_char_spans = token_spans_to_char_spans(
-        predicted_token_spans, char_starts, char_ends
-    )
-    if runtime.trim_span_whitespace:
-        predicted_char_spans = trim_char_spans_whitespace(
-            predicted_char_spans, source_text
-        )
-    if runtime.discard_overlapping_predicted_spans:
-        predicted_char_spans = discard_overlapping_spans_by_label(predicted_char_spans)
-
-    detected: list[DetectedSpan] = []
-    for label_idx, start, end in predicted_char_spans:
-        if not (0 <= start < end <= len(source_text)):
+    results: list[PredictionResult] = []
+    for example_id in example_order:
+        text = example_texts[example_id]
+        token_ids = example_token_ids[example_id]
+        if not token_ids:
+            results.append(PredictionResult(text=text, spans=(), decoded_mismatch=False))
             continue
-        label = (
-            str(runtime.label_info.span_class_names[label_idx])
-            if 0 <= int(label_idx) < len(runtime.label_info.span_class_names)
-            else f"label_{label_idx}"
-        )
-        detected.append(
-            DetectedSpan(
-                label=label,
-                start=int(start),
-                end=int(end),
-                text=source_text[start:end],
-                placeholder=_label_placeholder(label),
+        token_positions = token_positions_by_example[example_id]
+        decoded_labels = decoded_labels_by_example.get(example_id, [])
+        if len(decoded_labels) != len(token_positions):
+            score_vectors = [
+                aggregated_examples[example_id].logprob_logsumexp[token_idx]
+                for token_idx in token_positions
+                if aggregated_examples[example_id].logprob_logsumexp[token_idx] is not None
+            ]
+            if score_vectors:
+                stacked_scores = torch.stack(score_vectors, dim=0)
+                decoded_labels = stacked_scores.argmax(dim=1).tolist()
+        predicted_labels_by_index = {
+            token_idx: int(label)
+            for token_idx, label in zip(token_positions, decoded_labels)
+        }
+        results.append(
+            _build_prediction_result(
+                runtime,
+                text=text,
+                token_ids=token_ids,
+                predicted_labels_by_index=predicted_labels_by_index,
             )
         )
-
-    display_spans = _apply_output_mode_to_detected_spans(
-        _select_non_overlapping_spans(detected),
-        output_mode=runtime.output_mode,
-    )
-    return PredictionResult(
-        text=source_text,
-        spans=tuple(display_spans),
-        decoded_mismatch=decoded_mismatch,
-    )
+    return tuple(results)

@@ -11,15 +11,16 @@ from ._cli.args import (
     using_interactive_prompt,
 )
 
-_SUBCOMMANDS = frozenset({"redact", "eval", "train"})
+_SUBCOMMANDS = frozenset({"redact", "eval", "train", "serve"})
 _ROOT_DESCRIPTION = (
     "OpenAI Privacy Filter (OPF): redact text to remove PII. "
     "Redact locally via CLI and interactive mode; run evaluations; "
-    "or fine-tune on your own labeled dataset.\n\n"
+    "fine-tune on your own labeled dataset; or serve batched HTTP inference.\n\n"
     "Subcommands:\n"
     "  redact  Redact text locally (default, implied).\n"
     "  eval    Run encoder eval on a ground-truth dataset.\n"
     "  train   Fine-tune a checkpoint on a local labeled dataset.\n"
+    "  serve   Run an HTTP service with async queueing and micro-batching.\n"
     "Default mode: redact\n"
     "  The redact mode has additional flags; see `opf redact --help`."
 )
@@ -98,6 +99,8 @@ def _run_redaction_command(argv: Sequence[str], *, prog: str | None = None) -> N
     args = parse_args(argv, prog=prog)
     if args.json_indent < 0:
         raise ValueError("json_indent must be >= 0")
+    if args.input_batch_size <= 0:
+        raise ValueError("input_batch_size must be > 0")
 
     from ._api import RedactionResult
     from ._common.terminal_colors import build_label_color_map
@@ -131,13 +134,15 @@ def _run_redaction_command(argv: Sequence[str], *, prog: str | None = None) -> N
         if runtime.output_mode != "redacted":
             legend_labels = runtime.label_info.span_class_names
             label_colors = build_label_color_map(legend_labels)
-    for text in iter_inputs(args):
-        infer_start = time.perf_counter()
-        result = redactor.redact(text)
-        latency_ms = (time.perf_counter() - infer_start) * 1000.0
+
+    def emit_result(
+        result: str | RedactionResult,
+        *,
+        latency_ms: float,
+    ) -> None:
         if effective_format == "text":
             print(str(result))
-            continue
+            return
         if not isinstance(result, RedactionResult):
             raise TypeError("json output requires a structured RedactionResult")
         print(
@@ -157,6 +162,33 @@ def _run_redaction_command(argv: Sequence[str], *, prog: str | None = None) -> N
             print(render_color_legend(label_colors=label_colors))
             print("color coded text:")
             print(color_coded_text if color_coded_text else "(empty)")
+
+    if interactive_mode:
+        for text in iter_inputs(args):
+            infer_start = time.perf_counter()
+            result = redactor.redact(text)
+            latency_ms = (time.perf_counter() - infer_start) * 1000.0
+            emit_result(result, latency_ms=latency_ms)
+        return
+
+    pending_texts: list[str] = []
+
+    def flush_pending() -> None:
+        if not pending_texts:
+            return
+        infer_start = time.perf_counter()
+        results = redactor.redact_many(pending_texts)
+        batch_latency_ms = (time.perf_counter() - infer_start) * 1000.0
+        average_latency_ms = batch_latency_ms / float(len(results))
+        for result in results:
+            emit_result(result, latency_ms=average_latency_ms)
+        pending_texts.clear()
+
+    for text in iter_inputs(args):
+        pending_texts.append(text)
+        if len(pending_texts) >= args.input_batch_size:
+            flush_pending()
+    flush_pending()
 
 
 def _run_eval_command(argv: Sequence[str]) -> None:
@@ -183,6 +215,15 @@ def _run_train_command(argv: Sequence[str]) -> None:
     train_main(argv, prog=f"{resolve_prog('opf')} train")
 
 
+def _run_serve_command(argv: Sequence[str]) -> None:
+    """Dispatch to the HTTP service implementation."""
+    from ._serve.args import parse_args as parse_serve_args
+    from ._serve.runner import run as serve_run
+
+    args = parse_serve_args(list(argv), prog=f"{resolve_prog('opf')} serve")
+    serve_run(args)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run the unified ``opf`` command-line entrypoint."""
     argv_list = list(argv or [])
@@ -202,6 +243,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         if command == "train":
             _run_train_command(subcommand_argv)
+            return
+        if command == "serve":
+            _run_serve_command(subcommand_argv)
             return
     if any(arg in {"-h", "--help"} for arg in argv_list):
         build_parser().print_help()
