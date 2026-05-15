@@ -28,7 +28,7 @@ class ServiceSettings:
     max_batch_size: int
     batch_timeout_ms: float
     max_queue_size: int
-    window_batch_size: int
+    window_batch_size: int | None
     warmup: bool
 
 
@@ -50,12 +50,16 @@ class BatchedRedactionService:
         max_batch_size: int,
         batch_timeout_ms: float,
         max_queue_size: int,
-        window_batch_size: int,
+        window_batch_size: int | None,
     ) -> None:
         self._redactor = redactor
         self._max_batch_size = int(max_batch_size)
         self._batch_timeout_s = float(batch_timeout_ms) / 1000.0
-        self._window_batch_size = int(window_batch_size)
+        self._window_batch_size = (
+            int(window_batch_size)
+            if window_batch_size is not None
+            else None
+        )
         self._queue: asyncio.Queue[_QueuedRequest] = asyncio.Queue(maxsize=max_queue_size)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opf-serve")
         self._worker_task: asyncio.Task[None] | None = None
@@ -70,6 +74,11 @@ class BatchedRedactionService:
     def max_batch_size(self) -> int:
         """Return the configured request batch size."""
         return self._max_batch_size
+
+    @property
+    def max_queue_size(self) -> int:
+        """Return the configured maximum queue size."""
+        return int(self._queue.maxsize)
 
     @property
     def batch_timeout_ms(self) -> float:
@@ -96,25 +105,23 @@ class BatchedRedactionService:
 
     async def submit(self, text: str) -> dict[str, Any]:
         """Queue one text for batched inference and await its result."""
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
-        try:
-            self._queue.put_nowait(_QueuedRequest(text=text, future=future))
-        except asyncio.QueueFull as exc:
-            raise RuntimeError("service queue is full; try again shortly") from exc
-        return await future
+        return (await self.submit_many([text]))[0]
 
     async def submit_many(self, texts: Sequence[str]) -> list[dict[str, Any]]:
-        """Run a direct batched inference call for a batch endpoint request."""
+        """Queue multiple texts and await their results with shared backpressure."""
         if not texts:
             return []
+        if len(texts) > self.max_queue_size:
+            raise RuntimeError(
+                "batch request is too large for the configured queue; reduce client batch size"
+            )
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            self._executor,
-            self._run_redact_many,
-            list(texts),
-        )
-        return [self._serialize_result(item) for item in results]
+        futures: list[asyncio.Future[dict[str, Any]]] = []
+        for text in texts:
+            future: asyncio.Future[dict[str, Any]] = loop.create_future()
+            await self._queue.put(_QueuedRequest(text=text, future=future))
+            futures.append(future)
+        return list(await asyncio.gather(*futures))
 
     def _run_redact_many(
         self,
@@ -191,7 +198,11 @@ def settings_from_args(args: argparse.Namespace) -> ServiceSettings:
         max_batch_size=int(args.max_batch_size),
         batch_timeout_ms=float(args.batch_timeout_ms),
         max_queue_size=int(args.max_queue_size),
-        window_batch_size=int(args.window_batch_size),
+        window_batch_size=(
+            int(args.window_batch_size)
+            if args.window_batch_size is not None
+            else None
+        ),
         warmup=bool(args.warmup),
     )
 
@@ -268,6 +279,7 @@ def create_app(settings: ServiceSettings) -> Any:
         return {
             "status": "ok",
             "queue_size": service.queue_size,
+            "max_queue_size": service.max_queue_size,
             "max_batch_size": service.max_batch_size,
             "batch_timeout_ms": service.batch_timeout_ms,
             "window_batch_size": settings.window_batch_size,
@@ -291,6 +303,8 @@ def create_app(settings: ServiceSettings) -> Any:
     ) -> list[dict[str, Any]]:
         try:
             return await service.submit_many(payload.texts)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 

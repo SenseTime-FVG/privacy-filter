@@ -223,7 +223,7 @@ def _resolve_window_batch_size(
         if value <= 0:
             raise ValueError("OPF_WINDOW_BATCH_SIZE must be positive")
         return value
-    return 8 if device.type == "cuda" else 1
+    return 16 if device.type == "cuda" else 1
 
 
 def _resolve_viterbi_cuda_batch_size() -> int:

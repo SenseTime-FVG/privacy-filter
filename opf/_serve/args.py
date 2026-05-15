@@ -76,14 +76,17 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     batching_group.add_argument(
         "--max-queue-size",
         type=int,
-        default=1024,
+        default=512,
         help="Maximum number of pending requests allowed in the async queue.",
     )
     batching_group.add_argument(
         "--window-batch-size",
         type=int,
-        default=64,
-        help="Maximum number of model windows to combine in one batched forward pass.",
+        default=None,
+        help=(
+            "Maximum number of model windows to combine in one batched forward pass. "
+            "Defaults to the runtime policy (cuda=8, cpu=1, or OPF_WINDOW_BATCH_SIZE if set)."
+        ),
     )
     batching_group.add_argument(
         "--no-warmup",
@@ -108,6 +111,6 @@ def parse_args(
         raise ValueError("batch_timeout_ms must be >= 0")
     if args.max_queue_size <= 0:
         raise ValueError("max_queue_size must be > 0")
-    if args.window_batch_size <= 0:
+    if args.window_batch_size is not None and args.window_batch_size <= 0:
         raise ValueError("window_batch_size must be > 0")
     return args
